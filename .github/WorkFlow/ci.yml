@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: nestorawelle/juice-shop
+  IMAGE_NAME: nestorawele/juice-shop
   IMAGE_TAG: tagname
   DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
@@ -166,7 +166,7 @@ jobs:
         continue-on-error: true
         uses: docker/login-action@v3
         with:
-          username: nestorawelle
+          username: nestorawele
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build image and push when authenticated
         id: image
