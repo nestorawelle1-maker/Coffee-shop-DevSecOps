@@ -2,12 +2,14 @@ FROM node:22-bookworm-slim AS installer
 COPY . /juice-shop
 WORKDIR /juice-shop
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
-RUN npm ci
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+# The legacy postinstall script suppresses TypeScript errors; verify the server build explicitly.
+RUN npm run build:server && test -s build/app.js && test -s frontend/dist/frontend/index.html
 RUN npm prune --omit=dev --ignore-scripts
 RUN rm -rf frontend/node_modules
 RUN rm -rf frontend/.angular
 RUN rm -rf frontend/src/assets
-RUN mkdir logs
+RUN mkdir -p logs
 RUN chown -R 65532 logs
 RUN chgrp -R 0 ftp/ frontend/dist/ logs/ data/ i18n/
 RUN chmod -R g=u ftp/ frontend/dist/ logs/ data/ i18n/

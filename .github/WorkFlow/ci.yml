@@ -2,11 +2,9 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
-      - master
-      - develop
+    branches: [main, master, develop]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,18 +12,18 @@ permissions:
 env:
   IMAGE_NAME: nestorawelle/juice-shop
   IMAGE_TAG: tagname
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
   test:
-    continue-on-error: true
     name: Test
     runs-on: ubuntu-24.04
-
+    continue-on-error: true
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         continue-on-error: true
         uses: actions/checkout@v5
-
       - name: Set up Node.js
         continue-on-error: true
         uses: actions/setup-node@v6
@@ -33,157 +31,185 @@ jobs:
           node-version: 22.x
           cache: npm
           cache-dependency-path: |
-            package-lock.json
-            frontend/package-lock.json
-
-      - name: Install dependencies
+            package.json
+            frontend/package.json
+      - name: Install dependencies and build application
         continue-on-error: true
-        run: npm ci
-
-      - name: Run tests
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Run frontend tests
         continue-on-error: true
-        run: npm run test:all && npm run test:security
+        working-directory: frontend
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+        run: npx ng test --watch=false --source-map=false --browsers=ChromeHeadless
+      - name: Run server tests
+        continue-on-error: true
+        run: npm run test:server
 
   gitleaks:
-    continue-on-error: true
-    name: Gitleaks scan
+    name: Gitleaks secrets scan
     runs-on: ubuntu-24.04
-
+    continue-on-error: true
+    timeout-minutes: 15
     steps:
-      - name: Check out repository
+      - name: Check out repository and history
         continue-on-error: true
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-
-      - name: Check current source for secrets
+      - name: Scan current source for secrets
         continue-on-error: true
         run: |
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$GITHUB_WORKSPACE:/repo" \
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
             ghcr.io/gitleaks/gitleaks:v8.30.1 \
-            dir /repo --redact --config /repo/.gitleaks.toml --exit-code 0
-
-      - name: Run Gitleaks container
+            dir /repo --redact --verbose
+      - name: Scan Git history for secrets
         continue-on-error: true
         run: |
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$GITHUB_WORKSPACE:/repo" \
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
             ghcr.io/gitleaks/gitleaks:v8.30.1 \
-            detect --source=/repo --verbose --redact --exit-code 0 \
-            --report-format json --report-path /repo/gitleaks.json
+            git /repo --redact --verbose
 
   njsscan:
-    continue-on-error: true
-    name: NJS scan
+    name: njsscan Node.js security scan
     runs-on: ubuntu-24.04
-
+    continue-on-error: true
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         continue-on-error: true
         uses: actions/checkout@v5
-
       - name: Set up Python
         continue-on-error: true
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install njsscan
         continue-on-error: true
-        run: pip install njsscan
-
-      - name: Run njsscan
+        run: python -m pip install njsscan
+      - name: Scan Node.js source
         continue-on-error: true
-        run: |
-          njsscan . || true
-          njsscan . --defectdojo -o njsscan.json || true
+        run: njsscan .
 
   semgrep:
-    continue-on-error: true
-    name: Semgrep scan
+    name: Semgrep JavaScript and TypeScript scan
     runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 20
     container:
       image: semgrep/semgrep
-
     steps:
       - name: Check out repository
         continue-on-error: true
         uses: actions/checkout@v5
-
-      - name: Run Semgrep
+      - name: Scan source with Semgrep
         continue-on-error: true
         run: |
-          semgrep scan \
-            --config p/javascript \
-            --config p/typescript \
-            --config p/nodejs \
-            --metrics=off \
-            --verbose \
-            --json-output=semgrep.json || true
+          semgrep scan --config p/javascript --config p/typescript \
+            --config p/nodejs --metrics=off --error
 
   retirejs:
-    continue-on-error: true
-    name: Retire.js scan
+    name: Retire.js dependency scan
     runs-on: ubuntu-24.04
-
+    continue-on-error: true
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         continue-on-error: true
         uses: actions/checkout@v5
-
       - name: Set up Node.js
         continue-on-error: true
         uses: actions/setup-node@v6
         with:
           node-version: 22.x
-
-      - name: Install dependencies
+      - name: Install server dependencies without lifecycle scripts
         continue-on-error: true
-        run: |
-          npm ci --ignore-scripts
-          node scripts/remove-unused-benchmarks.js
-          npm ci --prefix frontend --ignore-scripts || npm install --prefix frontend --ignore-scripts
-
+        run: if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install --ignore-scripts; fi
+      - name: Install frontend dependencies without lifecycle scripts
+        continue-on-error: true
+        run: if [ -f frontend/package-lock.json ]; then npm ci --prefix frontend --ignore-scripts --legacy-peer-deps; else npm install --prefix frontend --ignore-scripts --legacy-peer-deps; fi
       - name: Install Retire.js
         continue-on-error: true
-        run: npm install -g retire
-
-      - name: Run Retire.js
+        run: npm install --global retire
+      - name: Scan JavaScript dependencies
         continue-on-error: true
-        run: |
-          retire --path . --outputformat json --outputpath retirejs.json --exitwith 0
+        run: retire --path .
 
   build:
-    continue-on-error: true
     name: Build and publish Docker image
     needs: test
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
-    if: github.event_name != 'pull_request'
+    continue-on-error: true
+    timeout-minutes: 45
     env:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
     steps:
       - name: Check out repository
         continue-on-error: true
         uses: actions/checkout@v5
-
-      - name: Log in to Docker Hub
+      - name: Set up Docker Buildx
         continue-on-error: true
-        if: env.DOCKERHUB_TOKEN != ''
+        uses: docker/setup-buildx-action@v3
+      - name: Check Docker Hub credentials
+        id: credentials
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::DOCKERHUB_TOKEN is missing. Add a Docker Hub token for nestorawelle with write permission in repository Actions secrets."
+            exit 1
+          fi
+      - name: Log in to Docker Hub
+        id: login
+        if: steps.credentials.outcome == 'success'
+        continue-on-error: true
         uses: docker/login-action@v3
         with:
           username: nestorawelle
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Docker image
+      - name: Build image and push when authenticated
+        id: image
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ env.DOCKERHUB_TOKEN != '' }}
-          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-
-#
+          push: ${{ steps.login.outcome == 'success' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+      - name: Verify published image in Docker Hub
+        id: registry
+        continue-on-error: true
+        if: steps.login.outcome == 'success' && steps.image.outcome == 'success'
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          test -n "$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$IMAGE_NAME@$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_TAG"
+      - name: Show Docker publishing result
+        continue-on-error: true
+        if: always()
+        env:
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          REGISTRY_OUTCOME: ${{ steps.registry.outcome }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          {
+            echo '## Docker Hub publishing'
+            if [ "$LOGIN_OUTCOME" = success ] && [ "$IMAGE_OUTCOME" = success ] && [ "$REGISTRY_OUTCOME" = success ] && [ -n "$IMAGE_DIGEST" ]; then
+              echo "Published: $IMAGE_NAME:$IMAGE_TAG"
+              echo "Digest: $IMAGE_DIGEST"
+              echo 'View tags: https://hub.docker.com/r/nestorawelle/juice-shop/tags'
+            else
+              echo '**Image publication was NOT verified.**'
+              echo "Docker Hub login: $LOGIN_OUTCOME"
+              echo "Docker image build/push: $IMAGE_OUTCOME"
+              echo "Docker Hub verification: $REGISTRY_OUTCOME"
+              echo 'Check the credentials, login, and build steps above. A green workflow does not confirm publication because job failures are tolerated.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

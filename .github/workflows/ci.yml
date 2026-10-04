@@ -31,11 +31,11 @@ jobs:
           node-version: 22.x
           cache: npm
           cache-dependency-path: |
-            package-lock.json
-            frontend/package-lock.json
+            package.json
+            frontend/package.json
       - name: Install dependencies and build application
         continue-on-error: true
-        run: npm ci
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
       - name: Run frontend tests
         continue-on-error: true
         working-directory: frontend
@@ -124,10 +124,10 @@ jobs:
           node-version: 22.x
       - name: Install server dependencies without lifecycle scripts
         continue-on-error: true
-        run: npm ci --ignore-scripts
+        run: if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install --ignore-scripts; fi
       - name: Install frontend dependencies without lifecycle scripts
         continue-on-error: true
-        run: npm ci --prefix frontend --ignore-scripts --legacy-peer-deps
+        run: if [ -f frontend/package-lock.json ]; then npm ci --prefix frontend --ignore-scripts --legacy-peer-deps; else npm install --prefix frontend --ignore-scripts --legacy-peer-deps; fi
       - name: Install Retire.js
         continue-on-error: true
         run: npm install --global retire
@@ -178,25 +178,38 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+      - name: Verify published image in Docker Hub
+        id: registry
+        continue-on-error: true
+        if: steps.login.outcome == 'success' && steps.image.outcome == 'success'
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          test -n "$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$IMAGE_NAME@$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_TAG"
       - name: Show Docker publishing result
         continue-on-error: true
         if: always()
         env:
           LOGIN_OUTCOME: ${{ steps.login.outcome }}
           IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          REGISTRY_OUTCOME: ${{ steps.registry.outcome }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
         shell: bash
         run: |
           {
             echo '## Docker Hub publishing'
-            if [ "$LOGIN_OUTCOME" = success ] && [ "$IMAGE_OUTCOME" = success ] && [ -n "$IMAGE_DIGEST" ]; then
+            if [ "$LOGIN_OUTCOME" = success ] && [ "$IMAGE_OUTCOME" = success ] && [ "$REGISTRY_OUTCOME" = success ] && [ -n "$IMAGE_DIGEST" ]; then
               echo "Published: $IMAGE_NAME:$IMAGE_TAG"
               echo "Digest: $IMAGE_DIGEST"
               echo 'View tags: https://hub.docker.com/r/nestorawelle/juice-shop/tags'
             else
-              echo '**Image was NOT published.**'
+              echo '**Image publication was NOT verified.**'
               echo "Docker Hub login: $LOGIN_OUTCOME"
               echo "Docker image build/push: $IMAGE_OUTCOME"
+              echo "Docker Hub verification: $REGISTRY_OUTCOME"
               echo 'Check the credentials, login, and build steps above. A green workflow does not confirm publication because job failures are tolerated.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
