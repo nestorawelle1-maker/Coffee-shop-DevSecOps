@@ -2,9 +2,11 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, master, develop]
+    branches:
+      - main
+      - master
+      - develop
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,17 +14,16 @@ permissions:
 env:
   IMAGE_NAME: nestorawelle/juice-shop
   IMAGE_TAG: tagname
-  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 30
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
@@ -31,158 +32,131 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             frontend/package-lock.json
-      - name: Install dependencies and build application
+
+      - name: Install dependencies
         run: npm ci
-      - name: Run frontend tests
-        continue-on-error: true
-        working-directory: frontend
-        env:
-          CHROME_BIN: /usr/bin/google-chrome
-        run: npx ng test --watch=false --source-map=false --browsers=ChromeHeadless
-      - name: Run server tests
-        continue-on-error: true
-        run: npm run test:server
+
+      - name: Run tests
+        run: npm run test:all && npm run test:security
 
   gitleaks:
-    name: Gitleaks secrets scan
+    name: Gitleaks scan
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 15
-    steps:
-      - name: Check out repository and history
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - name: Scan current source for secrets
-        continue-on-error: true
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
-            ghcr.io/gitleaks/gitleaks:v8.30.1 \
-            dir /repo --redact --verbose
-      - name: Scan Git history for secrets
-        continue-on-error: true
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
-            ghcr.io/gitleaks/gitleaks:v8.30.1 \
-            git /repo --redact --verbose
 
-  njsscan:
-    name: njsscan Node.js security scan
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check current source for secrets
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            dir /repo --redact --config /repo/.gitleaks.toml --exit-code 0
+
+      - name: Run Gitleaks container
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            detect --source=/repo --verbose --redact --exit-code 0 \
+            --report-format json --report-path /repo/gitleaks.json
+
+  njsscan:
+    name: NJS scan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install njsscan
-        run: python -m pip install njsscan
-      - name: Scan Node.js source
-        continue-on-error: true
-        run: njsscan .
+        run: pip install njsscan
+
+      - name: Run njsscan
+        run: |
+          njsscan . || true
+          njsscan . --defectdojo -o njsscan.json || true
 
   semgrep:
-    name: Semgrep JavaScript and TypeScript scan
+    name: Semgrep scan
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 20
     container:
       image: semgrep/semgrep
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
-      - name: Scan source with Semgrep
-        continue-on-error: true
+
+      - name: Run Semgrep
         run: |
-          semgrep scan --config p/javascript --config p/typescript \
-            --config p/nodejs --metrics=off --error
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejs \
+            --metrics=off \
+            --verbose \
+            --json-output=semgrep.json || true
 
   retirejs:
-    name: Retire.js dependency scan
+    name: Retire.js scan
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 20
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22.x
-      - name: Install server dependencies without lifecycle scripts
-        continue-on-error: true
-        run: npm ci --ignore-scripts
-      - name: Install frontend dependencies without lifecycle scripts
-        continue-on-error: true
-        run: npm ci --prefix frontend --ignore-scripts --legacy-peer-deps
+
+      - name: Install dependencies
+        run: |
+          npm ci --ignore-scripts
+          node scripts/remove-unused-benchmarks.js
+          npm ci --prefix frontend --ignore-scripts || npm install --prefix frontend --ignore-scripts
+
       - name: Install Retire.js
-        run: npm install --global retire
-      - name: Scan JavaScript dependencies
-        continue-on-error: true
-        run: retire --path .
+        run: npm install -g retire
+
+      - name: Run Retire.js
+        run: |
+          retire --path . --outputformat json --outputpath retirejs.json --exitwith 0
 
   build:
     name: Build and publish Docker image
     needs: test
-    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
-    continue-on-error: true
-    timeout-minutes: 45
+    if: github.event_name != 'pull_request'
     env:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Check Docker Hub credentials
-        id: credentials
-        continue-on-error: true
-        shell: bash
-        run: |
-          if [ -z "$DOCKERHUB_TOKEN" ]; then
-            echo "::error::DOCKERHUB_TOKEN is missing. Add a Docker Hub token for nestorawelle with write permission in repository Actions secrets."
-            exit 1
-          fi
+
       - name: Log in to Docker Hub
-        id: login
-        if: steps.credentials.outcome == 'success'
-        continue-on-error: true
+        if: env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
         with:
           username: nestorawelle
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build image and push when authenticated
-        id: image
-        continue-on-error: true
+
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ steps.login.outcome == 'success' }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-      - name: Show Docker publishing result
-        if: always()
-        env:
-          LOGIN_OUTCOME: ${{ steps.login.outcome }}
-          IMAGE_OUTCOME: ${{ steps.image.outcome }}
-          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
-        shell: bash
-        run: |
-          {
-            echo '## Docker Hub publishing'
-            if [ "$LOGIN_OUTCOME" = success ] && [ "$IMAGE_OUTCOME" = success ] && [ -n "$IMAGE_DIGEST" ]; then
-              echo "Published: $IMAGE_NAME:$IMAGE_TAG"
-              echo "Digest: $IMAGE_DIGEST"
-              echo 'View tags: https://hub.docker.com/r/nestorawelle/juice-shop/tags'
-            else
-              echo '**Image was NOT published.**'
-              echo "Docker Hub login: $LOGIN_OUTCOME"
-              echo "Docker image build/push: $IMAGE_OUTCOME"
-              echo 'Check the credentials, login, and build steps above. A green workflow does not confirm publication because job failures are tolerated.'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          push: ${{ env.DOCKERHUB_TOKEN != '' }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+#
