@@ -1,0 +1,162 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: nestorawelle/juice-shop
+  IMAGE_TAG: tagname
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test:all && npm run test:security
+
+  gitleaks:
+    name: Gitleaks scan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check current source for secrets
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            dir /repo --redact --config /repo/.gitleaks.toml --exit-code 0
+
+      - name: Run Gitleaks container
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            detect --source=/repo --verbose --redact --exit-code 0 \
+            --report-format json --report-path /repo/gitleaks.json
+
+  njsscan:
+    name: NJS scan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install njsscan
+        run: pip install njsscan
+
+      - name: Run njsscan
+        run: |
+          njsscan . || true
+          njsscan . --defectdojo -o njsscan.json || true
+
+  semgrep:
+    name: Semgrep scan
+    runs-on: ubuntu-24.04
+    container:
+      image: semgrep/semgrep
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejs \
+            --metrics=off \
+            --verbose \
+            --json-output=semgrep.json || true
+
+  retirejs:
+    name: Retire.js scan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+
+      - name: Install dependencies
+        run: |
+          npm ci --ignore-scripts
+          node scripts/remove-unused-benchmarks.js
+          npm ci --prefix frontend --ignore-scripts || npm install --prefix frontend --ignore-scripts
+
+      - name: Install Retire.js
+        run: npm install -g retire
+
+      - name: Run Retire.js
+        run: |
+          retire --path . --outputformat json --outputpath retirejs.json --exitwith 0
+
+  build:
+    name: Build and publish Docker image
+    needs: test
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: nestorawelle
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ env.DOCKERHUB_TOKEN != '' }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+#
