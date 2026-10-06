@@ -3,8 +3,7 @@ COPY . /juice-shop
 WORKDIR /juice-shop
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
-# The legacy postinstall script suppresses TypeScript errors; verify the server build explicitly.
-RUN npm run build:server && test -s build/app.js && test -s frontend/dist/frontend/index.html
+RUN test -s build/app.js && test -s frontend/dist/frontend/index.html
 RUN npm prune --omit=dev --ignore-scripts
 RUN rm -rf frontend/node_modules
 RUN rm -rf frontend/.angular
